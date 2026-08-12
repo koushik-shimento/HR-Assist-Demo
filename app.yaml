@@ -1,0 +1,9 @@
+command: ['streamlit', 'run', 'app.py']
+
+env:
+  - name: LAKEBASE_INSTANCE_NAME
+    value: "HR_assist"   # replace with your actual Lakebase project name
+  - name: STREAMLIT_GATHER_USAGE_STATS
+    value: "false"
+  - name: FILES_VOLUME_PATH
+    valueFrom: files_volume   # must match the resource key you set in Settings > Resources
