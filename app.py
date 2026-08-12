@@ -1,3 +1,6 @@
+import os
+from pathlib import Path
+
 import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
@@ -15,7 +18,15 @@ except Exception as e:
     st.warning(f"Schema init: {e}")
 
 
-st.title("HR Assist — Demo")
+# ---------- Header with Shimento X logo ----------
+LOGO_PATH = Path(__file__).parent / "assets" / "shimento_logo.png"
+
+header_left, header_right = st.columns([1, 5])
+with header_left:
+    if LOGO_PATH.exists():
+        st.image(str(LOGO_PATH), width=140)
+with header_right:
+    st.title("HR Assist — Demo")
 
 tab_jobs, tab_candidates, tab_matching, tab_funnel, tab_dashboard = st.tabs(
     ["Job Descriptions", "Candidates", "Matching & Screening", "Hiring Funnel", "Dashboard"]
@@ -55,36 +66,117 @@ with tab_jobs:
 
 # ---------- Candidates ----------
 with tab_candidates:
-    st.subheader("Add a candidate")
+    st.subheader("Add candidate(s)")
+    st.caption(
+        "Upload one resume with a name/email, or drop in many resumes at once "
+        "for bulk import (filename becomes the candidate name; edit later)."
+    )
+
     col1, col2 = st.columns(2)
     with col1:
-        name = st.text_input("Name")
-        email = st.text_input("Email")
-        resume_file = st.file_uploader("Upload resume (PDF, DOCX, or TXT)", type=["pdf", "docx", "txt"], key="resume_upload")
+        name = st.text_input("Name (used only when uploading a single resume or pasting text)")
+        email = st.text_input("Email (optional, single-upload only)")
+        resume_files = st.file_uploader(
+            "Upload resume(s) (PDF, DOCX, or TXT) — you can select multiple",
+            type=["pdf", "docx", "txt"],
+            key="resume_upload",
+            accept_multiple_files=True,
+        )
     with col2:
-        pasted_resume = st.text_area("Or paste resume text", height=150)
+        pasted_resume = st.text_area(
+            "Or paste a single resume as text (used only when no files uploaded)",
+            height=150,
+        )
 
-    if st.button("Add candidate", type="primary"):
-        resume_text = extract_text(resume_file) if resume_file else pasted_resume
-        if not name or not resume_text.strip():
-            st.error("Need a name and either an uploaded resume or pasted text.")
-        else:
-            row = run(
-                "INSERT INTO candidates (name, email, resume_text, resume_filename) VALUES (%s, %s, %s, %s) RETURNING id",
-                (name, email, resume_text, resume_file.name if resume_file else None),
-                fetchone=True,
-            )
-            if resume_file:
-                vol_path = save_upload(resume_file, "resumes", row["id"])
+    if st.button("Add candidate(s)", type="primary"):
+        # ---- Case A: no files uploaded → single candidate from pasted text ----
+        if not resume_files:
+            resume_text = pasted_resume
+            if not name or not resume_text.strip():
+                st.error("Need a name and either an uploaded resume or pasted text.")
+            else:
+                row = run(
+                    "INSERT INTO candidates (name, email, resume_text, resume_filename) "
+                    "VALUES (%s, %s, %s, %s) RETURNING id",
+                    (name, email, resume_text, None),
+                    fetchone=True,
+                )
+                st.success(f"Added candidate: {name}")
+
+        # ---- Case B: exactly 1 file → honor the name/email fields ----
+        elif len(resume_files) == 1:
+            f = resume_files[0]
+            resume_text = extract_text(f)
+            cand_name = name.strip() if name.strip() else Path(f.name).stem
+            if not resume_text.strip():
+                st.error(f"Couldn't extract any text from {f.name}.")
+            else:
+                row = run(
+                    "INSERT INTO candidates (name, email, resume_text, resume_filename) "
+                    "VALUES (%s, %s, %s, %s) RETURNING id",
+                    (cand_name, email, resume_text, f.name),
+                    fetchone=True,
+                )
+                vol_path = save_upload(f, "resumes", row["id"])
                 if vol_path:
-                    run("UPDATE candidates SET resume_volume_path = %s WHERE id = %s", (vol_path, row["id"]))
-            st.success(f"Added candidate: {name}")
+                    run(
+                        "UPDATE candidates SET resume_volume_path = %s WHERE id = %s",
+                        (vol_path, row["id"]),
+                    )
+                st.success(f"Added candidate: {cand_name}")
+
+        # ---- Case C: bulk upload → one candidate per file, filename = name ----
+        else:
+            added, skipped = [], []
+            progress = st.progress(0.0, text="Uploading resumes…")
+            total = len(resume_files)
+
+            for i, f in enumerate(resume_files, start=1):
+                try:
+                    resume_text = extract_text(f)
+                    if not resume_text.strip():
+                        skipped.append((f.name, "no text extracted"))
+                        continue
+                    cand_name = Path(f.name).stem
+                    row = run(
+                        "INSERT INTO candidates (name, email, resume_text, resume_filename) "
+                        "VALUES (%s, %s, %s, %s) RETURNING id",
+                        (cand_name, "", resume_text, f.name),
+                        fetchone=True,
+                    )
+                    vol_path = save_upload(f, "resumes", row["id"])
+                    if vol_path:
+                        run(
+                            "UPDATE candidates SET resume_volume_path = %s WHERE id = %s",
+                            (vol_path, row["id"]),
+                        )
+                    added.append(cand_name)
+                except Exception as e:
+                    skipped.append((f.name, str(e)))
+                finally:
+                    progress.progress(i / total, text=f"Processed {i}/{total}")
+
+            progress.empty()
+            if added:
+                st.success(f"Added {len(added)} candidate(s): {', '.join(added)}")
+            if skipped:
+                with st.expander(f"{len(skipped)} file(s) skipped — click for details"):
+                    for fname, reason in skipped:
+                        st.write(f"• **{fname}** — {reason}")
 
     st.divider()
-    candidates = run("SELECT id, name, email, resume_filename, resume_volume_path, created_at FROM candidates ORDER BY created_at DESC", fetch=True)
+    candidates = run(
+        "SELECT id, name, email, resume_filename, resume_volume_path, created_at "
+        "FROM candidates ORDER BY created_at DESC",
+        fetch=True,
+    )
     st.subheader("Existing candidates")
-    st.dataframe(pd.DataFrame(candidates) if candidates else pd.DataFrame(columns=["id", "name", "email", "resume_filename", "resume_volume_path"]),
-                 use_container_width=True)
+    st.dataframe(
+        pd.DataFrame(candidates)
+        if candidates
+        else pd.DataFrame(columns=["id", "name", "email", "resume_filename", "resume_volume_path"]),
+        use_container_width=True,
+    )
 
 # ---------- Matching & Screening ----------
 with tab_matching:
